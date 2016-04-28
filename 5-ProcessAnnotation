@@ -1,0 +1,1320 @@
+#!/usr/bin/perl
+use warnings;
+use strict;
+use File::Basename;
+use Getopt::Std;
+use Getopt::Long;
+#use File::Temp;
+use List::Util qw( min max );
+
+#Ke Bi (kebi@berkeley.edu) Sept. 3 2013
+
+
+
+&main;
+exit;
+
+sub main {
+        &usage if (@ARGV<1);
+        my $command = shift(@ARGV);
+        my %fun = (Merge=>\&Merge, Filter=>\&Filter, TrimORF=>\&TrimORF, Exon=>\&Exon);
+        die("Unknown command \"$command\"\n") if (!defined($fun{$command}));
+        &{$fun{$command}};
+      }
+
+
+sub usage {
+  die(qq/
+Usage:  6-ProcessAnnotation <command> [<arguments>]\n
+
+Command: 
+
+Merge:          Merge annotated transcripts by blasting against various references. 
+                It also filters out redundancies via self-blasting
+
+Filter:         Basic filters on length, GC content, and repetitive elements
+
+
+TrimORF:        Trim off sequences outside the ORF
+
+
+Exon:           Only applicable when exon identification is desired and possible 
+
+
+NOTE: 
+##################################################
+if Transcript targets are desired then run:
+Merge -> Filter -> TrimORF
+
+if Exonic targets are desired then run:
+Merge -> Filter -> Exon
+##################################################
+
+\n/);
+}
+
+
+
+####################################################################################################################################################
+
+sub Exon {
+
+die(qq/
+6-ProcessAnnotation Exon [options] 
+
+options:
+-p    FILE      Reference protein 
+-g    FILE      Reference genomic DNA
+-f    DIR       Annotated transcript (2-***) 
+                outputted by "6-ProcessAnnotation Filter"
+-e    INT       Minimal length cutoff for an exon to keep [200]
+-E    INT       Maximal length cutoff for an exon to keep [100000000000]
+-M    FLOAT     Maximun GC content cutoff for an exon to keep [0.7]
+-m    FLOAT     Minimal GC content cutoff for an exon to keep [0.4]
+-o    CHAR      prefix for output
+                
+
+
+Note: if more than 1 reference is used for annotation then combine the references for options -p and -g
+
+What this script will do:
+1. find unique exons in the reference (e.g. human)
+2. find the unique exons in each of the annotated trascripts you are interested in
+3. find homologous exons in each of the annotated trascripts, align them and remove redundancies
+4. calculate pairwise sequence divergence between orthologous exons (also variance, length, g\/c etc)
+5. export the following files: 1) all othologous exonic markers, 2) markers (one per gene) that pass the length and GC filter and ranked by average divergencet.
+
+
+\n\n/) unless (@ARGV);
+
+my %opts = (p=>undef, g=>undef, o=>undef, e=>200, f=>undef, M=>0.7, m=>0.4, E=>100000000000,n=>1, o=>undef);
+getopts('p:g:o:e:f:m:M:E:n:o:', \%opts);
+
+#-n    INT       How many random exons do you want to use as popgen markers [500]
+
+
+my $file = $opts{f};
+
+my $dir = dirname($file) . "/"; 
+
+
+my @annotation = <$dir*fasta>;
+my $Exons = $dir. 'exons';
+my $uniqueExons = $Exons . ".unique";
+my $exonLength = $opts{e};
+my $Max_exonLength = $opts{E};
+my $dbP = $opts{p};
+my $dbG = $opts{g};
+my $minGC = $opts{m};
+my $maxGC = $opts{M};
+my $popGen = $opts{n};
+my $name = $opts{o};
+
+#choose the longest protein as reference for annotation
+
+open (REGION, "<", $dbP);
+my %prob;
+my $id;
+my $gene;
+my $cor;
+while (<REGION>) {
+  chomp (my $line = $_);
+  if ($line =~ m/^>/) {
+    chomp (my @l = split /\s+/, $line);
+    next if $l[5] =~ m/pseudogene/;
+    chomp (my @a = split /:/, $l[2]);
+    $id = $1 if $l[0] =~ /^>(ENS\S+)/;
+    $gene = $1 if  $l[3] =~ /gene:(ENS\S+)/;
+    $cor = $l[2];
+    $prob{$gene}{$id}{'cor'} = $cor;
+  }
+  else {
+    $prob{$gene}{$id}{'seq'} .= $line;
+    $prob{$gene}{$id}{'len'} += length($line);
+  }
+}
+close REGION;
+
+$dbP = $dir . 'longest_protein.fasta';
+open (OUT, ">", $dbP);
+
+foreach my $gene (sort {$a cmp $b} keys %prob) {
+  foreach my $transcript (sort {$prob{$gene}{$b}{'len'} <=> $prob{$gene}{$a}{'len'}} keys %{$prob{$gene}}) {   
+    print OUT ">$gene", "\t", $prob{$gene}{$transcript}{'cor'}, "\n",   $prob{$gene}{$transcript}{'seq'}, "\n"; 
+    last;    
+  }
+}
+close OUT;
+
+
+unless (-f $uniqueExons) {
+  print "now looking for unique exons in the reference! Hey by the way did you choose the right reference?", "\n";
+  findUniqueExons($Exons,$dbP,$dbG,$Exons, $uniqueExons, $exonLength)
+}
+
+  
+  print "\n";
+  my $ids = $2 if basename($file) =~ m /^2_(\S+)\./;
+  
+    print "now looking for unique exons in ", basename($file), "!\n";
+    alignment($file, $uniqueExons, $dir, $exonLength, $Max_exonLength, $minGC, $maxGC, $name);
+    my $infile = $dir . $ids. '_exon.fa';
+    my $self1 = $dir . $ids. '_exon.fa1';
+    my $hash_self = readSeq1 ($infile, $self1);
+    my %hash_self = %{$hash_self};
+    my $self2 = $dir . $ids. '_exon.fa2';
+    system ("cp $self1 $self2");
+    my $final_nr = $dir . "3_" . $ids. '_exon.fa.final';
+    print "\n\n";
+    print "now doing self-blasting for identified exons in $ids!","\n";
+    self1($self1, $self2, \%hash_self, $final_nr);
+    
+  
+
+print "\n";
+
+#################################################################################
+sub makeHash {
+  my ($protein, $genome) = @_;		
+  my %anno;
+  my %genome;
+  
+  open (PRO, "<", $protein);
+
+  my $gene;
+  while (<PRO>) {
+    chomp(my $line = $_);
+    if ($line =~ m/^>(ENS\S+)/) {
+      $gene = $1;
+      my @a = split(/\s/,$line);
+      my @d = split(/:/,$a[1]);
+      my $contig = $d[2];
+      my $start = $d[3];
+      my $end = $d[4];
+      $anno{$gene} = {'prot'=> $gene, 'contig'=> $contig, 'start'=>$start, 'end'=>$end};
+    }	  
+    else { 
+      $anno{$gene}{'seq'} .= $line;
+    }
+    
+  }	
+  close PRO;
+  
+  
+  open (GENOME, "<", $genome);
+  my $id;
+  my ($pos,$pos2);
+  
+  while (<GENOME>) {
+    chomp (my $line = $_);
+    if ($line =~ m/^>(\S+)/) {
+      $id = $1; 
+      $pos = tell (GENOME);
+    }
+    unless ($line =~ m/^>(\S+)/) {
+      push @{$genome{$id}}, $pos;
+      $pos2 = tell (GENOME);
+      $pos = $pos2;    
+    }    
+  }	
+  close GENOME;
+  return(\%anno,\%genome);
+  
+}
+sub findUniqueExons {
+  my ($anolisExons,$dbP,$dbG, $Exons, $uniqueExons, $exonLength) = @_;		
+  open(OUT, ">$anolisExons");			
+  my ($anno, $genome) = makeHash($dbP, $dbG);
+  my %anno = %$anno;
+  my %genome = %$genome;
+  
+  #$anno{$id} = {'prot'=>$id, 'contig'=>$contig, 'start'=>$start, 'end'=>$end, 'seq' =$seq};				
+  open (GE, "<", $dbG);
+  foreach my $ID (keys %anno) {			
+    my %final;
+    my $contigID = $anno{$ID}{'contig'};
+    my $seq = $anno{$ID}{'seq'};
+    my $e;
+    my $m;
+    if ($genome{$contigID}) {
+      for (my $i = 0 ; $i< scalar @{$genome{$contigID}}; $i++) {
+	seek GE, $genome{$contigID}[$i], 0;
+	chomp ($e = <GE>);
+	$m .= $e; 
+      }
+      my $DNA = substr ($m,$anno{$ID}{'start'}-1, $anno{$ID}{'end'}-$anno{$ID}{'start'}+1);   
+  
+      
+      my $target2 = "target2.fa";
+      my $query2 = "query2.fa";
+      
+      open (T2, ">$target2");
+      open (Q2, ">$query2");
+      
+      print T2 ">$ID\n$DNA\n";
+      print Q2 ">protein\n$seq\n";
+      
+      my @call = `exonerate --model protein2genome $query2 $target2 --showvulgar no --showalignment no --showtargetgff yes`;
+      my $cleanup = system("rm $query2 $target2");
+      my %cds;
+      foreach(@call){
+	if ($_ =~ m/orientation/) {
+	  $cds{'orient'} = $1 if $_ =~ m/([\+|\-])\s+\./;
+	}
+	elsif ($_ =~ m/exon\s+/) {
+	  my $bounds = $1 if $_ =~ m/exon\t([0-9]+\t[0-9]+)/;;
+	  my @bounds = split("\t", $bounds);
+	  $cds{'exon'}{$bounds[0]}=$bounds[1];
+	}
+      }
+      
+      #need to allow for a failure to find cds 
+      if (keys %cds){
+	my $tracker = 1;
+	if ($cds{'orient'} eq '+') {
+	  foreach(sort {$a <=> $b} keys %{$cds{'exon'}}){
+	    my $start = $_;
+	    my $end = $cds{exon}{$start};
+	    my $length = $end - $start + 1;
+	    $start = $start - 1;
+	    my $sub = substr $DNA, $start, $length;
+	    my $loc = $anno{$ID}{'contig'};
+	    my $loc_s = $anno{$ID}{'start'} + $start;
+	    my $loc_e = $loc_s + $length - 1;
+	    $loc = $loc . '_' . $loc_s . '_' . $loc_e;
+	    
+	    my $id = ">" . $ID . "_exon" . $tracker;
+	    $final{$id}{'seq'} = $sub;
+			      $final{$id}{'loc'} = $loc;
+	    $tracker++;
+	  }
+	}
+	else {
+	  foreach(sort {$b <=> $a} keys %{$cds{'exon'}}){
+	    my $start = $_;
+	    my $end = $cds{exon}{$start};
+	    my $length = $end - $start + 1;
+	    $start = $start - 1;
+	    my $sub = substr $DNA, $start, $length;
+	    $sub = reverse($sub);
+	    $sub =~ tr/ATGCatgc/TACGtacg/;
+	    
+	    my $loc = $anno{$ID}{'contig'};
+	    my $loc_s =$anno{$ID}{'start'} + $start;
+	    my $loc_e = $loc_s + $length - 1;                       
+	    $loc = $loc. '_' .$loc_s . '_' . $loc_e;
+	    
+	    my $id = ">" . $ID . "_exon" . $tracker;
+	    $final{$id}{'seq'} = $sub;
+	    $final{$id}{'loc'} = $loc;
+	  }
+	}
+	foreach my $id (keys %final) {
+	  print OUT $id, "\t$final{$id}{'loc'}\n", $final{$id}{'seq'}, "\n";
+	}
+      }	
+      else {
+	print "couldn't define CDS for $ID\n";
+      }
+    }
+  }
+  close(OUT);
+  close (GE);
+  my $call1 = system("cd-hit-est -i $Exons -o $uniqueExons -c 0.95 -l $exonLength");
+  my $call2 = system("rm $uniqueExons" . ".*");
+  
+}
+
+ sub self1 {
+    my ($query, $db, $final, $out) = @_;
+    my %final = %{$final};
+    my $blastout = $query . '_blast.out';
+    my $call1 = system("makeblastdb -in $db -dbtype nucl");
+    my $call2 = system("blastn -db $db -query $query -evalue 1e-30 -outfmt 6 -out $blastout");
+    system("rm $db.n*");
+    open(IN, "<$query");
+    my %seq;
+    while (<IN>) {
+      chomp(my @line = split /\s+/, $_);
+      if ($line[0] =~ m/>(\S+)/) {
+	my $id = $1;
+	chomp(my $seq = <IN>);
+	$seq{$id} = {'seq'=>$seq, 'len'=> length ($seq)};
+      }
+    }
+    close(IN);
+    
+    my %tmp;
+    open(IN, "<$blastout");
+    while (<IN>) {
+      chomp(my $line = $_);
+      my @d = split(/\s+/,$line);
+      push(@{$tmp{$d[0]}},\@d);
+    }
+    close(IN);
+    system ("rm $blastout");
+    
+ my %final1;
+    foreach my $id (sort {$a cmp $b} keys %tmp) {
+      my %match;
+      if (scalar(@{$tmp{$id}}) > 1) {
+      for (my $i = 0; $i < scalar(@{$tmp{$id}}); $i++) {   
+	  $match{$tmp{$id}[$i][1]} = $seq{$tmp{$id}[$i][1]}{'len'};      	  
+      }
+       
+      foreach my $ids (sort { $match{$b} <=> $match{$a} } keys %match) {
+	    $final1{$ids}{'seq'} = $final{$ids}{'seq'};   
+	    last; 
+       }
+    }
+	      
+    if (scalar(@{$tmp{$id}} == 1) ) {
+       $final1{$id}{'seq'} = $final{$id}{'seq'};
+       
+    }  
+
+   }
+
+   my $ref = $query. "_tmp_file.txt";
+    open (OUT, ">", $ref);
+    foreach my $anno (sort {$a cmp $b} keys %final1) {
+	  print OUT  ">", $final{$anno}{'species'}, "\t", $final{$anno}{'contig'}, "\t", $anno,"\n", $final1{$anno}{'seq'}, "\n";     
+	}   
+       close OUT;
+    
+
+    my $ref1 = $ref . ".1"; 
+    system("cd-hit-est -i $ref -o $ref1 -M 0 -l 36 -d 100 -B 1 -r 1 -n 8");
+    system ("mv $ref1 $out");
+    system ("rm $ref1.* $ref");
+
+    unlink ($query);
+    unlink ($db);
+  }
+ } 
+
+sub readSeq1 {
+  my ($seqfile, $out) = @_;
+  my %seq;
+  open(IN, "<$seqfile");
+  
+  open (OUT, ">", $out);
+  while (<IN>) {
+    chomp(my @line = split /\s+/, $_);
+    if ($line[0] =~ m/^>(\S+)/) {
+      my $species = $1;
+      my $contig = $line[1];
+      my $prot = $line[2];
+      
+      chomp(my $seq = <IN>);
+      $seq{$prot} = {'seq'=>$seq, 'contig' => $contig, 'species' => $species};
+      print OUT ">", $prot, "\n", $seq,"\n";
+    }
+  }
+  close IN;
+  close OUT;
+  return(\%seq); 
+}
+
+sub alignment {
+  my ($seq,$uniqueExons, $dir,$exonLength, $Max_exonLength, $minGC, $maxGC,$name) = @_;		
+  my %seq;
+ 
+  open(SEQ, "<", $seq);	
+  while(<SEQ>) {
+    chomp(my @line = split /\s+/, $_);
+    if (scalar @line >1) {
+      if ($line[0] =~ m/>(\S+)/) {
+	my $id = $1;
+	my $prot = $line[2];	  
+	chomp(my $seq = <SEQ>);
+	$seq{$prot} = {'contig' => $id, 'seq' => $seq};
+      }
+    }
+  }
+  close SEQ; 
+ 
+  my %exons;
+  open(IN, "<", $uniqueExons);
+  while(<IN>) {
+    chomp(my $line = $_);
+    if ($line =~ m/>(\S+)/) {
+      my $id = $1;
+      chomp(my $seq = <IN>);
+      $exons{$id} = $seq;
+    }
+  }
+  close IN; 
+  
+  my $out = $dir . "3-". $name.  "_exon.fa";
+  open(FINAL, ">", $out);	
+  foreach my $exon (sort {$a cmp $b} keys %exons) {
+    
+    my $s = $1 if ($exon =~ m/^(ENS\S+)_exon\d+/);
+    if ($seq{$s}) {
+      my $target = "target.fa";
+      my $query = "query.fa";
+      open (T, ">", $target);
+      open (Q, ">", $query);
+      
+      print T ">$seq{$s}{'contig'}\n$seq{$s}{'seq'}\n";
+      print Q ">$exon\n$exons{$exon}\n";
+       
+   
+      my $elength = length($exons{$exon});
+      my @call = `exonerate -m coding2coding $query $target --bestn 1  --showvulgar yes --showalignment no`;
+      system("rm $query $target");
+      
+      
+      if ($call[3]) {
+
+	if ($call[2] =~ m/vulgar/) {
+	  my @d = split(/\s+/,$call[2]);
+	  my $length = abs($d[6] - $d[7]);					
+	  my $sub; 
+	  my $start;
+	  
+	  if ($d[4] =~ m/\+/ && $d[8] =~ m/\+/) {
+	    $start = $d[6];
+	    $sub = substr $seq{$s}{'seq'}, $start, $length;
+	  }
+	  elsif ($d[4] =~ m/\+/ && $d[8] =~ m/\-/) {
+	    $start = $d[7];
+	    $sub = substr $seq{$s}{'seq'}, $start, $length;
+	    $sub = reverse($sub);
+	    $sub =~ tr/ATGCatgc/TACGtacg/;
+	  }
+	  elsif ($d[4] =~ m/\-/ && $d[8] =~ m/\-/) {
+	    $start = $d[7];
+	    $sub = substr $seq{$s}{'seq'}, $start, $length;
+	  }
+	  elsif ($d[4] =~ m/\-/ && $d[8] =~ m/\+/) {
+	    $start = $d[6];
+	    $sub = substr $seq{$s}{'seq'}, $start, $length;
+	    $sub = reverse($sub);
+	    $sub =~ tr/ATGCatgc/TACGtacg/;
+	  }
+	  
+	  if ($length/$elength >= 0.9) {
+	    my $end = $start + $length - 1;
+	    my $loc = $seq{$s}{'contig'} . '_' . $start . "_" . $end;
+            #$exonLength, $Max_exonLength, $minGC, $maxGC
+             my $seq = $sub;
+             my $seq2 = $sub;
+             my $l = ($seq =~ s/[ATGC]//ig);
+             my $gc = ($seq2 =~ s/[GC]//ig);
+             
+            if ($gc/$l >= $minGC && $gc/$l <= $maxGC && $l >= $exonLength && $l <=$Max_exonLength  ){
+	    print FINAL ">$name", "\t", "$loc", "\t", $exon, "\n", $sub, "\n";
+	  }
+}
+	}				
+      }	
+    }
+    
+  }
+  close FINAL;
+}
+  
+
+sub TrimORF {
+die(qq/
+6-ProcessAnnotation TrimORF [options] 
+
+external dependencies: exonerate
+
+options:
+-f    FILE    Annotated transcript (2-***) 
+              outputted by "6-ProcessAnnotation Filter"
+-b    FILE    Combined reference protein database
+-c    INT     Number of bp to keep outside the orf [500]
+-o    CHAR    Prefix for outfile
+
+\n\n/) unless (@ARGV);
+
+
+my %opts = (f=>undef, b=>undef, c=>500, o=>undef);
+getopts('f:b:c:o:', \%opts);
+
+
+my $trans = $opts{f};
+my $ref = $opts{b};
+my $cut = $opts{c};
+my $out = dirname($trans) . "/" . "3-" . $opts{o} . "_transcript_target.fasta";
+
+open (PRO, "<", $ref);
+my $id;
+my %refpro;
+#my ($pos,$pos2);
+
+while (<PRO>) {
+  chomp (my $line = $_);
+  if ($line =~ m/^>(\S+)/) { 
+    chomp (my @l = split /\s+/, $line);
+  
+    $id = $1 if  $l[3] =~ /gene:(ENS\S+)/;
+    #$pos = tell (PRO);
+    
+  }
+  unless ($line =~ m/^>(\S+)/) {
+    $refpro{$id} .= $line;
+    
+    #push @{$refpro{$id}}, $pos;
+    #$pos2 = tell (PRO);
+    #$pos = $pos2;
+     
+  }    
+}	
+close PRO;
+
+my $ID;
+my %seq;
+open (SEQ, "<", $trans);
+while (<SEQ>) {
+  chomp (my $line =$_);
+  if ($line =~ m/^>(\S+)/) {
+    $ID = $1;
+    my @d = split /\s+/, $line;
+    my $prot = $d[2];
+    #my $pos = tell (SEQ);
+    chomp (my $seq = <SEQ>);
+    $seq{$prot} = {'pos' => $seq, 'contig' => $ID, 'rest' => join ("\t", @d[2..$#d])};
+  }  
+} 
+
+my %new_seq;
+foreach my $contig (sort {$a cmp $b} keys %seq) {
+  if ($refpro{$contig}) {
+  
+    
+    my $target = "target.fa";
+    my $query = "query.fa";
+  
+    open (T, ">", $target);
+    open (Q, ">", $query);
+    
+    print Q ">seq","\n", $seq{$contig}{'pos'}, "\n";
+    print T ">protein", "\n", $refpro{$contig}, "\n";  
+ 
+    my $contiglength = length($seq{$contig}{'pos'});
+    
+    my @exon = `exonerate $target $query -m protein2genome --showalignment no --showcigar 0`;
+    unlink($query); unlink($target);
+    my @match;
+    close T; close Q;
+  my $start = 99999999;
+  my $end = 99999999;
+  #length ($seq{$contig}{'pos'});
+  if (scalar @exon > 3) {
+  foreach (@exon) {
+    chomp (my @line = split /\s+/, $_);
+    if ($line[0] =~m /vulgar/) {
+      if ($line [8] eq '-') {
+	#print "WTF?? still has errors at this point?? I am gonna quit science and I want to be a super hero like spiderman instead!", "\n";
+	
+        
+      }
+      push @match, $line[6]+1;
+      push @match, $line[7]+1;
+    } # if ($line[0] =~m /vulgar/) {
+  }
+    $start = min (@match) if @match;
+    $end = max (@match) if @match;
+   print   $contig , "\n" if $start == 99999999;
+  exit if $start == 99999999;
+
+  if ($contiglength - $end <= $cut ) {
+    if ($start <= $cut) {
+      $new_seq{$contig} = {'seq' => $seq{$contig}{'pos'}, 'contig' => $seq{$contig}{'contig'}, 'rest' =>$seq{$contig}{'rest'}};
+    }
+    if ($start > $cut) {
+      my $seq2 = substr ($seq{$contig}{'pos'}, $start-$cut-1);
+      $new_seq{$contig} = {'seq' => $seq2, 'contig' => $seq{$contig}{'contig'}, 'rest' =>$seq{$contig}{'rest'}};
+    }
+  }
+  if ($contiglength - $end > $cut) {
+    if ($start <= $cut) {
+      my $seq2 = substr ($seq{$contig}{'pos'}, 0, $end+$cut);
+      $new_seq{$contig} = {'seq' => $seq2, 'contig' => $seq{$contig}{'contig'}, 'rest' =>$seq{$contig}{'rest'}};
+    }
+    if ($start > $cut) {
+      my $seq2 = substr ($seq{$contig}{'pos'}, $start-$cut-1, $end-$start+$cut+$cut+1);
+      $new_seq{$contig} = {'seq' => $seq2, 'contig' => $seq{$contig}{'contig'}, 'rest' =>$seq{$contig}{'rest'}};
+    }
+  }
+ 
+    }
+  }  
+  #close SEQ; close PRO;
+}
+open (OUT, ">", $out);
+foreach my $name ( sort{$a cmp $b} keys %new_seq) {
+  print OUT ">", $new_seq{$name}{'contig'}, "\t", $new_seq{$name}{'rest'},"\n",  $new_seq{$name}{'seq'},"\n";
+}
+close OUT;
+
+
+
+}
+sub Merge {
+  
+  die(qq/
+6-ProcessAnnotation Merge [options] 
+
+options:
+-a     FILE      Master annotation file (e.g. anolis.fasta).
+-b     DIR       Directory with all other annotation files 
+                 (e.g. a folder containing: chicken.fasta, 
+                 human.fasta, fish.fasta, etc.)
+-c     FILE      A file containing a list of fasta sequences 
+                 that are needed to be filtered out [null]. 
+                 Note if you don't have any then just don't use -c
+-d     CHAR      Output prefix
+
+\n\n/) unless (@ARGV);
+  
+  my %opts = (a=>undef, b=>undef, c=>undef, d=>undef);
+  getopts('a:b:c:d:', \%opts);
+  
+  my $dir;
+  
+  if ($opts{b} =~ m/\/$/ ){
+    $dir = $opts{b}; 
+  }
+  else {
+    $dir = $opts{b} . "/";
+  }
+  
+  my @all_data = <$dir*fasta>;
+  my $anolis = $opts{a};
+  
+  my $name = $opts{d};
+  
+  my $new_anolis = dirname($anolis). "/" . $name . "_final_original_names.txt";   
+  readAnnotation ($anolis, $new_anolis);
+  my $out = $anolis . "_only2.txt";  
+  my $new_anole = readSeq ($new_anolis, $out);
+  
+  
+  foreach (@all_data) {
+    my $annotation = $_ . "_only.txt"; 
+    my $out1 = $_ . "_only2.txt";
+    my $no_match =  $_ . "_no_match.txt";
+    
+    readAnnotation($_, $annotation);
+    my $new = readSeq($annotation, $out1);
+    my %new = %{$new};
+    my $out2 = "anolis_annotation_combined.txt"; 
+    print "\n\n";
+    print "now comparing ", basename($out), " with ", basename($out1), "!\n";
+    PWblast($out, $out1, $out2,\%new, $no_match);
+    system ("mv $out2 $out");
+    my $final1 = 'temp';
+    system ("cat $new_anolis $no_match > $final1");
+    system ("rm $new_anolis");
+    system ("mv $final1 $new_anolis");
+    system ("rm $annotation");
+  }
+  
+  unlink ($out);
+  my $self1 = $new_anolis . "1";
+  my $hash = renameSeq($new_anolis, $self1);
+  my %hash = %{$hash};
+  my $self2 = $new_anolis . "2";
+  system ("cp $self1 $self2");
+  my $final_nr = dirname($anolis). "/" . $name. '_annotation.final';
+  
+  print "\n\n";
+  print "now doing self-blasting!","\n";
+  self($self1, $self2, \%hash, $final_nr);
+  
+  if ($opts{c}) {
+  my $clean = $final_nr . "1";
+  my $hash1 = readSeq($final_nr, $clean);
+  my %hash1 = %{$hash1};
+  my $final_out = dirname($final_nr). "/1-" . $name. '_annotation_filtered.final';
+  
+  print "\n\n";
+  print "now filtering out stuff that you do not want!","\n";
+  filter($clean, $opts{c}, \%hash1, $final_out);
+  system ("rm $final_nr");
+  my $s = size($final_out);
+  print "\n\n";
+  print "the size of final dataset is ", $s, "bp!", "\n"; 
+  print "\n\n";
+}
+  
+  else {
+    my $final_out = dirname($final_nr). "/1-" . $name. '_annotation_filtered.final';
+    my $s = size($final_nr);
+    system ("mv  $final_nr $final_out");
+    print "\n\n";
+    print "the size of final dataset is ", $s, "bp!", "\n";
+    print "\n\n";
+  }
+
+  
+  
+  #############################################################
+  
+  sub filter {
+    my ($db, $query, $hash, $out) = @_;
+    my %clean = %{$hash};
+    my $blastout = 'filter_blast.out';
+    my $call1 = system("makeblastdb -in $db -dbtype nucl");
+    my $call2 = system("blastn -db $db -query $query -evalue 1e-5 -outfmt 6 -out $blastout");
+    system("rm $db.n*");
+    
+    my %tmp;
+    open(IN, "<$blastout");
+    while (<IN>) {
+      chomp(my $line = $_);
+      my @d = split(/\s+/,$line);
+      $tmp{$d[1]}++;
+    }
+    close(IN);
+    system ("rm $blastout");
+    open (OUT, ">", $out);
+    foreach my $anno (sort {$a cmp $b} keys %clean) {
+      unless ($tmp{$anno}) {
+	print OUT  ">", $anno, "\t", $clean{$anno}{'rest'}, "\n", $clean{$anno}{'seq'},"\n"; 
+      }   
+    }
+    close OUT;
+    unlink ($db);
+    
+  } 
+  
+  
+  sub self {
+    my ($query, $db, $final, $out) = @_;
+    my %final = %{$final};
+    my $blastout = $query.'blast.out';
+    my $call1 = system("makeblastdb -in $db -dbtype nucl");
+    my $call2 = system("blastn -db $db -query $query -evalue 1e-20 -outfmt 6 -out $blastout");
+    system("rm $db.n*");
+    open(IN, "<$query");
+    my %seq;
+    while (<IN>) {
+      chomp(my @line = split /\s+/, $_);
+      if ($line[0] =~ m/>(\S+)/) {
+	my $id = $1;
+	chomp(my $seq = <IN>);
+	$seq{$id} = {'seq'=>$seq, 'len'=> length ($seq)};
+      }
+    }
+    close(IN);
+    
+    my %tmp;
+    open(IN, "<$blastout");
+    while (<IN>) {
+      chomp(my $line = $_);
+      my @d = split(/\s+/,$line);
+      push(@{$tmp{$d[0]}},\@d);
+    }
+    close(IN);
+    system ("rm $blastout");
+    
+     my %final1;
+    foreach my $id (sort {$a cmp $b} keys %tmp) {
+      my %match;
+      if (scalar(@{$tmp{$id}}) > 1) {
+      for (my $i = 0; $i < scalar(@{$tmp{$id}}); $i++) {   
+	  $match{$tmp{$id}[$i][1]} = $seq{$tmp{$id}[$i][1]}{'len'};      	  
+      }
+       
+      foreach my $ids (sort { $match{$b} <=> $match{$a} } keys %match) {
+	    $final1{$ids}{'seq'} = $final{$ids}{'seq'};
+	    
+	    last; 
+       }
+    
+    }
+	      
+    if (scalar(@{$tmp{$id}} == 1) ) {
+       $final1{$id}{'seq'} = $final{$id}{'seq'};
+    
+    }  
+
+   }
+    my $ref = $query. "tmp_file.txt";
+    open (OUT, ">", $ref);
+    foreach my $anno (sort {$a cmp $b} keys %final1) {
+	  print OUT  ">", $anno, "\t", $final{$anno}{'rest'}, "\n", $final{$anno}{'seq'},"\n";   
+	}   
+       close OUT;
+    
+
+    my $ref1 = $ref . ".1"; 
+    system("cd-hit-est -i $ref -o $ref1 -M 0 -l 36 -d 100 -B 1 -r 1 -n 8");
+    system ("mv $ref1 $out");
+    system ("rm $ref1.* $ref");
+    
+    unlink ($query);
+    unlink ($db);
+  }
+  
+  
+  sub PWblast {
+    my ($anolis, $next, $out, $new, $no_match) = @_;
+    my %new =%{$new};
+    my $blastout = dirname($anolis) . "/". basename($anolis) . "_" . basename($next). '.blast.out';
+    my $call1 = system("makeblastdb -in $next -dbtype nucl");
+    my $call2 = system("blastn -db $next -query $anolis -evalue 1e-50 -outfmt 6 -out $blastout");
+    
+    my %r;
+    open(IN, "<$blastout");
+    while(<IN>) {
+      chomp(my @line = split /\s+/,$_);
+      $r{$line[1]}++;
+    }
+    close(IN);
+    unlink($blastout);
+    system("rm $next.n*");
+    
+    open (NEW, "<", $next);
+    my $left = dirname($anolis) . "/". "no_match_to_anole_in_" . basename($next). ".txt";
+    open (OUT, ">", $left);
+    open (OUT2, ">", $no_match);
+    while (<NEW>) {
+      chomp(my @line = split /\s+/,$_);
+      my $id = $1 if $line[0] =~ m/>(\S+)/;
+      chomp(my $seq = <NEW>);
+      unless ($r{$id}) {
+	print OUT join ("\t", @line),  "\n", $seq, "\n";
+	print OUT2 ">", $id, "\t", $new{$id}{'rest'}, "\n", $new{$id}{'seq'},"\n";
+      }
+    }
+    
+    close NEW; close OUT; close OUT2;   
+    system ("cat $anolis $left > $out");
+    unlink ($left);
+    unlink ($next);
+    
+  }
+  
+  
+  sub renameSeq {
+    my ($file, $out1) = @_;
+    my %hash;
+    my $out = $file . '2';
+    open(IN, "<$file");
+    open(OUT, ">$out");
+    
+    my $number = 1;
+    while (<IN>) {
+      chomp(my @line = split /\s+/, $_);
+      
+      if ($line[0] =~ m/>/) {
+	chomp(my $seq = <IN>);
+	my $id = 'Contig' . $number;
+	$hash{$id} = {'seq'=>$seq, 'rest'=>join ("\t",@line[1..$#line])};
+	print OUT ">", $id, "\n", $seq,"\n";
+	$number++;
+      }
+    }
+    close(IN); close(OUT);
+    rename($out,$out1);
+    return (\%hash);
+  }       
+  
+  sub readSeq {
+    my ($seqfile, $out) = @_;
+    my %seq;
+    open(IN, "<$seqfile");
+    
+    open (OUT, ">", $out);
+    while (<IN>) {
+      chomp(my @line = split /\s+/, $_);
+      if ($line[0] =~ m/>(\S+)/) {
+	my $id = $1;
+	chomp(my $seq = <IN>);
+	$seq{$id} = {'seq'=>$seq, 'rest'=>join ("\t",@line[1..$#line])};
+	print OUT ">",$id, "\n", $seq,"\n";
+      }
+    }
+    close IN;
+    close OUT;
+    return(\%seq); 
+  }
+  
+  sub readAnnotation {
+    my ($seqfile, $annotation) = @_; 
+    open(IN, "<$seqfile");
+    open (OUT, ">", $annotation);
+    while (<IN>) {
+      chomp(my $line =  $_);
+      if ($line =~ m/ENS/) {
+	chomp(my $seq = <IN>);
+	print OUT $line, "\n", $seq,"\n";
+      }
+      
+    }
+    close IN; close OUT;
+  }
+  
+  
+  sub size {
+    my ($seq) = @_;
+    open (IN, "<", $seq); 
+    my $len;
+    while (<IN>) {
+      chomp(my $line = $_);
+      if ($line=~ m/^>(\S+)/) {
+	chomp(my $seq = <IN>);
+	$len += length($seq);    
+      }   
+    }
+    close IN;
+    return ($len); 
+  }
+  
+}
+
+###########################################################################
+
+sub Filter {
+  
+  die(qq/
+6-ProcessAnnotation Filter [options] 
+
+options: 
+
+-f    FILE    Annotated fasta sequences (1-***) 
+              outputted by "6-ProcessAnnotation Merge"
+-a    INT     Min length of contig [201]
+-b    INT     Max length of contg [9999999]
+-c    INT     Min GC content (percent) [35]
+-d    INT     Max GC content (percent) [70]
+-R    CHAR    Species used for repeatmasking. some 
+              examples are: human, mouse, rattus, 
+              "ciona savignyi",arabidopsis, mammal, 
+               carnivore, rodentia, rat, cow, pig,
+              cat, dog, chicken, fugu, danio, 
+              "ciona intestinalis", drosophila, 
+              anopheles, elegans,diatoaea, artiodactyl, 
+              rice, wheat, maize, "vertebrata metazoa" 
+-g    CHAR    Outfile prefix
+\n\n/) unless (@ARGV);
+  
+  my %opts = (a=>201, b=>9999999, c=>35, d=>70, f=>undef, g=>undef, R=>undef);
+  getopts('a:b:c:d:f:g:R:', \%opts);
+  
+  my $annotation = $opts{f};
+  
+  my ($gc_out, $gc) = GC($annotation, $opts{c}, $opts{d}, $opts{g});
+  my $s = size($gc_out);
+  print "\n\n";
+  print "the size of transcripts after GC filtering is ", $s, "bp!", "\n"; 
+  print "\n\n";
+  
+  my ($len_out, $len) = cut_len($gc_out,$opts{a}, $opts{b}, $opts{g});
+  my $le = size($len_out);
+  print "\n\n";
+  print "the size of transcripts after GC and length filtering is ", $le, "bp!", "\n"; 
+  print "\n\n";
+  
+  my $rep;
+  if ($opts{R}) {
+    $rep = $opts{R};
+    my @rep = split /\s+/, $rep;
+    if (scalar (@rep) > 1) {
+      $rep = '"' . $rep . '"'; 
+    }
+  }
+ 
+  system ("RepeatMasker -q -no_is -species $rep $len_out");
+  
+  my $infile = $len_out . ".masked";
+  
+  my %filter_masked;
+  unless (-z $infile) {
+    open (IN, "<", $infile);
+    my $id;   
+    while (<IN>) {
+      chomp (my $line = $_);
+      if ($line =~ /^>/) {
+	$id = $line;
+      }
+      else {
+	$filter_masked{$id} .= $line;    
+      }
+    }
+    close IN;
+  }
+  else {
+    open (IN, "<",$len_out);
+    my $id;   
+    while (<IN>) {
+      chomp (my $line = $_);
+      if ($line =~ /^>/) {
+	$id = $line;
+      }
+      else {
+	$filter_masked{$id} .= $line;    
+      }
+    }
+    close IN;
+  }
+
+  my $fa_repeatmasked = dirname ($len_out) . "/2-". $opts{g}. "_GC_length_repeatmasked.txt"; 
+  open (OUT, ">", $fa_repeatmasked);
+  system ("rm $len_out* ");
+
+  foreach my $id ( keys %filter_masked) {
+    my $seq = $filter_masked{$id};
+    my $length = length ($seq);
+    my $seq1 = $seq;
+    my $N = ($seq1 =~ s/N//ig);
+    unless ($N/$length >= 0.5){
+      
+	print OUT  $id, "\n", $seq, "\n";
+     
+    }
+  }
+  close OUT;
+  my $le2 = re_size($fa_repeatmasked);
+  print "\n\n";
+  print "the size of transcripts after GC/length filtering and repeatmasking is ", $le2, "bp!", "\n"; 
+  print "\n\n";
+  
+   sub re_size {
+    my ($seq) = @_;
+    open (IN, "<", $seq); 
+    my $len;
+    while (<IN>) {
+      chomp(my $line = $_);
+      if ($line=~ m/^>(\S+)/) {
+	chomp(my $s = <IN>);
+	my $sz = ($s =~ tr/ATCG//);
+	
+	$len += $sz;
+      }
+      
+    }
+    close IN;
+    return ($len); 
+  } 
+ 
+  sub GC {
+    my ($file, $min, $max, $prefix) = @_;
+    open (IN, "<", $file);
+    my $out_final = dirname ($file) . "/". $prefix. "_GC_filtered.txt";
+    my $out_GC =  dirname ($file) . "/". $prefix. "_contigs_with_extreme_GC.txt";
+    open (FINAL, ">",  $out_final);
+    open (GC, ">", $out_GC);
+    
+    while (<IN>) {
+      chomp (my $line = $_);
+      if ($line =~ m/^>/) {
+	chomp (my $seq = <IN>);
+	my $SEQ = uc($seq);
+	my $l = ($SEQ =~ tr/ATGCN//);
+	my $GC = ($SEQ =~ tr/GC/gc/);
+	my $percentGC = ($GC/$l)*100;
+	my $rounded = sprintf("%.2f", $percentGC);	  	     
+	if ($percentGC >= $min &&  $percentGC <= $max ) {	  
+	  print FINAL $line, "\n", $seq,"\n";
+	}
+	else {
+	  print GC $line, "\n", $seq, "\n", $rounded, "\n";
+	}
+      }
+      
+    }
+    close IN; close FINAL; close GC;
+    return ($out_final, $out_GC);	
+  }
+  
+  sub cut_len {
+    my ($file, $min, $max, $prefix) = @_;
+    open (IN, "<", $file);
+    my $len_final = dirname ($file) . "/2-". $prefix. "_GC_length_filtered.txt";
+    my $len_out =  dirname ($file) . "/". $prefix. "_contigs_with_extreme_lengths.txt";
+    open (FINAL, ">",  $len_final);
+    open (LEN, ">", $len_out);
+    
+    while (<IN>) {
+      chomp (my $line = $_);
+      if ($line =~ m/^>/) {
+	chomp (my $seq = <IN>);
+	my $size = length ($seq);	  	     
+	if ($size >= $min && $size <= $max ) {	  
+	  print FINAL $line, "\n", $seq,"\n";
+	}
+	else {
+	  print LEN $line, "\n", $seq, "\n", $size, "\n";
+	}
+      }
+      
+    }
+    close IN; close FINAL; close LEN;
+    return ($len_final, $len_out);	
+  } 
+}
+
+####################################################################################
+
+
+sub masking {
+  
+  die(qq/
+6-ProcessAnnotation masking [options] 
+
+options: 
+-a    FILE    Repeat_masking file (repeat masker format)
+-b    FILE    Annotated fasta sequences (2-***) outputted
+              by "6-ProcessAnnotation basic" 
+-g    CHAR    Outfile prefix
+\n\n/) unless (@ARGV);
+  
+  my %opts = (a=>undef, b=>undef, g=>undef);
+  getopts('a:b:g:', \%opts);
+  
+  my $repeat = $opts{a};
+  my $annotation = $opts{b};
+  my $name = $opts{g};
+    
+  my $clean = $annotation . "1";
+  
+  my $hash1 = readSeq($annotation, $clean);
+  my %hash1 = %{$hash1};
+
+  my $outfile = repeatmasking($repeat, $clean, $name, \%hash1);
+  
+  system ("rm $clean"); 
+  
+  my $le = re_size($outfile);
+  print "\n\n";
+  print "the size of transcripts after repeat masking is ", $le, "bp!", "\n"; 
+  print "\n\n";
+
+  
+ 
+
+  sub repeatmasking {
+    my ($repeat, $anno, $prefix, $hash) = @_; 
+    my %h = %{$hash};
+    my %mask;
+    open (RE, "<", $repeat); 
+    while (<RE>) {
+      chomp(my $line = $_);
+      next if ($line !~ /^\s*\d+/);
+      next if ($line =~ m/Low_complexity/);
+      my @d = split;   
+      push(@{$mask{$d[4]}}, [$d[5], $d[6]]);
+    }
+    close RE;
+    
+    my %seq;
+    open (IN, "<", $anno); 
+    while (<IN>) {
+      chomp (my $line = $_);
+      my $ID = $1 if ($line =~ m/^>(\S+)/);
+      chomp (my $seq = <IN>);
+      $seq{$ID} = $seq;
+    }
+    close IN;
+    
+    my $out = dirname($anno) . "/3-". $prefix ."_repeats_masked.txt";
+    open (OUT, ">", $out);
+ 
+    foreach my $id (sort {$a cmp $b} keys %seq) {
+      if ($mask{$id}) {	
+	my $seq = $seq{$id};
+	for (my $i = 0; $i < scalar(@{$mask{$id}}); $i++) {   
+	  my $start = $mask{$id}[$i][0];
+	  my $end = $mask{$id}[$i][1];
+	  my $s = min ($start, $end);
+	  my $e = max ($start, $end);	  	  
+	  my $masked = 'n' x ($e-$s+1);	  
+	  my $length = length ($masked);
+	  substr ($seq, $s-1, $length) = $masked;
+	}
+	print OUT ">", $id, "\t", $h{$id}{'rest'}, "\n", $seq, "\n"; 
+      }     
+      else {
+	my $seq = $seq{$id};
+	print OUT ">", $id, "\t", $h{$id}{'rest'}, "\n", $seq, "\n";	
+      }
+      
+    }
+    close OUT;
+    return ($out);
+
+  }
+
+}
+
+##############################################################################################
+
+sub rmgene {
+  die (qq/
+Usage: 6-ProcessAnnotation rmgene [options]
+
+Options:
+        -genes       CHAR.....         Genes to be removed 
+                                       (e.g. rRNA snRNA 18S ribosomal Histone). 
+                                       You can give as many as possible (case insensitive)
+        -annot       FILE              Annotated fasta sequences (3-***) 
+                                       outputted by "6-ProcessAnnotation masking"
+        -out         CHAR              Outfile prefix
+
+\n/) if !@ARGV;
+  
+  
+  my ($annot, $genes, $out) = (undef, undef, undef);
+  GetOptions('genes=s@{1,}' => \$genes,'annot=s@{1,1}' => \$annot,'out=s@{1,1}' => \$out);
+ 
+  my $dir = dirname (@{$annot}[0]) . "/";
+  my $file =  @{$annot}[0]; 
+  my $prefix = @{$out}[0]; 
+  
+
+  my %seq;
+  open(IN, "<", $file);
+  while (<IN>) {
+    chomp(my @line = split /\s+/, $_);
+    if ($line[0] =~ m/>(\S+)/) {
+      my $id = $1;
+      chomp(my $seq = <IN>);
+      $seq{$id} = {'seq'=>$seq, 'rest'=>join ("\t",@line[1..$#line])};
+    }
+  }
+  close IN;
+
+  my $out_seq = $dir . "4-". $prefix. "_with_unwanted_genes_being_removed.txt";
+  my $genes_removed = $dir . $prefix. "_removed_genes.txt";
+  open (FINAL, ">", $out_seq);
+  open (REMOVE,">", $genes_removed);
+
+  foreach (@{$genes}) {
+    my $gene = $_;
+    foreach my $id (sort {$a cmp $b} keys %seq) { 
+      if ($seq{$id}{'rest'} =~ m/$_/i) {
+      print REMOVE ">", $id, "\t", $seq{$id}{'rest'}, "\n", $seq{$id}{'seq'}, "\n";
+      delete $seq{$id};  
+      }    
+    }
+  }
+  close REMOVE;
+  
+  foreach my $id (sort {$a cmp $b} keys %seq) { 
+    print FINAL ">", $id, "\t", $seq{$id}{'rest'}, "\n", $seq{$id}{'seq'}, "\n";
+  }
+  close FINAL;
+
+}
+  
+    
+
+
+
+
+
+
+
+
+
+
+

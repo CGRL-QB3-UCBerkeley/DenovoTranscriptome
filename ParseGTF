@@ -1,0 +1,299 @@
+#!/usr/bin/perl
+use warnings;
+use strict;
+use Getopt::Std;
+use Getopt::Long;
+use File::Basename;
+use List::Util qw[min max];
+use List::Util qw(sum);
+use File::Temp;
+
+die (qq/
+
+Usage: ParseGTF [options] 
+
+Options:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+-f    FILE    Ensembl GTF file
+-g    FILE    Ensembl Genome file
+-o    INT     offset bp you would like to add onto each end of
+              the exons [100]
+-p    INT     1 = only consider protein coding genes
+              2 = consider all genes including miRNA\/snRNA etc.
+              [1]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Note: Mitochondrial genome and rRNA is excluded
+
+\n\n/) unless (@ARGV);
+
+
+my %opts = (f=>undef, g=>undef, o=>100,p=>1);
+getopts('f:g:o:p:', \%opts);
+
+
+
+my $gtf = $opts{f};
+my $genome = $opts{g};
+my $offset = $opts{o};
+my $prot = $opts{p};
+
+
+my $dir = dirname($gtf) . "/" . "results/";
+mkdir $dir unless -e $dir;
+
+
+my $exon = $dir . 'exons';
+my $tembed = $dir . 'exon.bed';
+
+open (GTF, "<", $gtf);
+open (BED, ">", $tembed);
+
+while (<GTF>) {
+  chomp (my $a = $_);
+  next if $a =~ /"pseudogene"/;
+  next if $a =~ m/^#/;   
+  next if $a =~ m/^MT/i;
+  next if $a =~ m/rRNA/i;
+  
+  if ($prot == 1) {
+    if ($a =~ m /protein_coding/) {
+      chomp (my @line = split /\s+/,$a);
+      my $chr = $line[0];
+      my $cds = $line[2];
+      my $start = $line[3];
+      my $end = $line[4];
+      my $strand = $line[6];
+      
+      
+      my $gene = $1 if $line[9] =~ m /"(\S+)";/;
+      print $gene,"\n" if $start > $end;
+      exit if $start > $end;
+      
+      if ($cds eq 'exon') {
+	print BED $chr. "_" . $gene, "\t", $start, "\t", $end, "\n";
+      }
+    }
+  } ###if ($prot == 1) {
+  
+  if ($prot == 2) {
+    next if 
+    chomp (my @line = split /\s+/,$a);
+    my $chr = $line[0];
+    my $cds = $line[2];
+    my $start = $line[3];
+    my $end = $line[4];
+    my $strand = $line[6];
+
+    my $gene = $1 if $line[9] =~ m /"(\S+)";/;
+    print $gene,"\n" if $start > $end;
+    exit if $start > $end;
+    
+    if ($cds eq 'exon') {
+      print BED $chr. "_" . $gene, "\t", $start, "\t", $end, "\n";
+    }
+  }
+  
+ } 
+
+close OUT;
+close BED;
+
+MakeBed ($tembed, $offset);
+unlink ($tembed);
+
+my %bed;
+my $finalBed = $tembed. "_final";
+open (BED, "<",$finalBed );
+my $d = 1;
+my $prev = '';
+while (<BED>) {
+  chomp (my @line = split /\s+/,$_);
+  if ($prev eq $line[0]) {
+    $d++;
+    $bed{$line[0]}{$d} = {'start'=>$line[1], 'end'=>$line[2]};
+  }
+  if ($prev ne $line[0]) {
+    $d = 1;
+    $bed{$line[0]}{$d} = {'start'=>$line[1], 'end'=>$line[2]};
+    $prev = $line[0];
+  }
+}
+close BED;
+
+
+my %genome;
+open (GENOME, "<", $genome);
+my $id;
+while (<GENOME>) {
+  chomp (my $line = $_);
+  if ($line =~ m/^>(\S+)/) {
+    $id = $1;
+  }
+  else {
+    $genome{$id} .= $line;
+  }
+}
+close GENOME;
+open (OUT, ">",$exon );
+
+foreach my $id (sort {$a cmp $b} keys %bed) {
+  my $chr = $1 if $id =~ /(\S+)_(ENS\S+)/;
+  my $gene = $2;
+ 
+  
+  if ($genome{$chr}) {
+    foreach my $number (sort {$a <=> $b} keys %{$bed{$id}}) {
+      print OUT  ">", $gene, "_exon", $number, "\t", $chr, "_", $bed{$id}{$number}{'start'}, "_", $bed{$id}{$number}{'end'}, "\n";
+      print OUT substr ($genome{$chr}, $bed{$id}{$number}{'start'}, $bed{$id}{$number}{'end'}-$bed{$id}{$number}{'start'}+1 ), "\n";
+    }
+
+
+  } 
+
+  
+}
+close OUT;
+
+my $uniqueExons = $dir . "exons.unique";
+system("cd-hit-est -i $exon -o $uniqueExons -c 0.95 -l 50");
+system("rm $uniqueExons" . ".*");
+system("rm $exon");
+
+
+
+
+sub MakeBed {
+  my ($bed, $offset) = @_;
+  open (BED, "<", $bed);
+  my @Bed;
+  my $count =0;
+  while (<BED>) {
+    chomp (my @name = split /\s+/, $_);
+    #add bed to matrix
+    
+      $Bed[$count] -> [0] = $name[0]; #contig name
+      $Bed[$count] -> [1] = $name[1]; #start coordinate
+      $Bed[$count] -> [2] = $name[2]; #end coordinate
+      $count++;
+    
+  }
+  close BED;
+  
+  @Bed = sort { $a->[0] cmp $b->[0] || $a->[1] <=> $b->[1] || $a->[2] <=> $b->[2]} @Bed; 
+
+  
+  my ($tmp_offset, $tmp);
+
+  #create temp files to save space!  
+  $tmp_offset = File::Temp->new(SUFFIX=>'.offset');
+  $tmp = File::Temp->new(SUFFIX=>'.original');
+
+  foreach (@Bed) {
+    print $tmp @{$_}[0], "\t", @{$_}[1], "\t", @{$_}[2], "\n";   
+    if (@{$_}[1] >= $offset) {
+      print $tmp_offset @{$_}[0], "\t", @{$_}[1]-$offset, "\t", @{$_}[2]+$offset, "\n";
+    }
+    else {
+      print $tmp_offset @{$_}[0], "\t", 0, "\t",  @{$_}[2]+$offset, "\n";
+    }
+  }
+  
+  seek $tmp, 0, 0; #rewind $region list to beginning for main loop
+  seek $tmp_offset, 0, 0;
+  
+  my $out1 = $bed . "_offset_final";
+  mining ($tmp_offset, $out1);
+  my $out2 = $bed . "_final";
+  mining ($tmp, $out2);
+  unlink ($tmp_offset, $tmp);
+
+}
+
+   
+  sub mining {
+    my ($file, $out) = @_;
+    open (IN, "<", $file);
+    open (OUT, ">", $out);
+    
+    chomp (my $first = <IN>);
+    my @d = split /\s+/, $first;
+    
+    my $gene = $d[0];
+    my $start = $d[1];
+    my $end = $d[2];
+    
+    while (<IN>) { ##do not forget to process the end of file!!
+      
+      chomp (my @line = split /\s+/, $_);
+      if ($line[0] eq $gene) {
+	
+	if (!eof){ ## if not the end of the file
+	  
+	  if ($line[1] > $end) {
+	    print OUT $gene, "\t", $start, "\t", $end, "\n";
+	    $start = $line[1];
+	    $end = $line[2];
+	  } 	
+	  if ($line[1] <= $end && $line[1] >= $start) {
+	    if ($line[2] >= $end) {
+	      $end = $line[2];	  
+	    }	 	  
+	  }
+	  if ($line[1] < $start) {
+	    $start = $line[1];
+	    if ($line[2] >= $end) {
+	      $end = $line[2];	  
+	    }	  
+	  }
+	}
+	
+	else { #end of the file; need to print both lines. Same as below
+	  if ($line[1] > $end) {
+	    print OUT $gene, "\t", $start, "\t", $end, "\n";
+	    print OUT $gene, "\t", $line[1], "\t", $line[2], "\n";
+	  } 	
+	  if ($line[1] <= $end && $line[1] >= $start) {
+	    if ($line[2] >= $end) {
+	      print OUT $gene, "\t", $start, "\t", $line[2], "\n";	      
+	    } 
+	    else {
+	      print OUT $gene, "\t", $start, "\t", $end, "\n";
+	    }
+	  }
+	  if ($line[1] < $start) {
+	    if ($line[2] >= $end) {
+	      print OUT $gene, "\t", $line[1], "\t", $line[2], "\n";
+	    }
+	    else {
+	      print OUT $gene, "\t", $line[1], "\t", $end, "\n";
+	    } 
+	  }
+	}	
+      }
+      
+      
+      if ($line[0] ne $gene) {
+	if (!eof) {
+	  print OUT $gene, "\t", $start, "\t", $end, "\n";	
+	  $gene = $line[0];
+	  $start = $line[1];
+	  $end = $line[2];   
+	}
+	else {
+	  print OUT $gene, "\t", $start, "\t", $end, "\n";
+	  $gene = $line[0];
+	  $start = $line[1];
+	  $end = $line[2]; 
+	  print OUT $gene, "\t", $start, "\t", $end, "\n";
+	}
+      }
+    }
+    close IN;
+    close OUT;
+  } 
+
+
+
+
